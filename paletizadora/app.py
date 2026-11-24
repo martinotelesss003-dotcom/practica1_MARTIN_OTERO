@@ -1,4 +1,6 @@
-import os, json, base64, threading, time, logging, unicodedata
+import os, json, base64, threading, time, logging, unicodedata, secrets
+from collections import OrderedDict
+from full import parse_pack, detect_full
 from pathlib import Path
 import cv2
 import numpy as np
@@ -25,10 +27,21 @@ annotations={
 orb=cv2.ORB_create(nfeatures=4000,fastThreshold=10)
 bf=cv2.BFMatcher(cv2.NORM_HAMMING)
 lock=threading.Lock()
+pack_lock=threading.Lock()
+packs=OrderedDict()
+@app.post('/api/references')
+def upload_references():
+ try:
+  pack=parse_pack(request.get_json());token=secrets.token_urlsafe(24)
+  with pack_lock:
+   packs[token]=pack
+   while len(packs)>8:packs.popitem(last=False)
+  return jsonify(token=token,regions=len(pack),points=sum(len(r[1]) for r in pack))
+ except (ValueError,KeyError,TypeError,AttributeError):return jsonify(error='Archivo de referencias incorrecto'),400
 @app.get('/')
 def home():return send_from_directory(P,'index.html')
 @app.get('/api/health')
-def health():return jsonify(backend=True,references=len(refs),mode='ORB',yolo=False,version='4.3')
+def health():return jsonify(backend=True,references=len(refs),mode='ORB',yolo=False,version='4.5')
 @app.post('/api/detect')
 def detect():
  try:
@@ -36,6 +49,18 @@ def detect():
   im=cv2.imdecode(np.frombuffer(raw,np.uint8),cv2.IMREAD_GRAYSCALE)
   if im is None:return jsonify(error='Imagen inválida'),400
   h,w=im.shape;s=960/max(w,h);im=cv2.resize(im,(round(w*s),round(h*s)));h,w=im.shape
+  token=data.get('reference_token')
+  if token:
+   with pack_lock:
+    selected=packs.get(token)
+    if selected is not None:packs.move_to_end(token)
+   if selected is None:return jsonify(error='Recarga las referencias',reload_references=True),409
+   with lock:out,diag=detect_full(im,selected)
+   prompt=normalize(str(data.get('prompt','')).strip())
+   if prompt:out=[o for o in out if any(t.strip() in normalize(o['name']) for t in prompt.split(',') if t.strip())]
+   diag['ms']=round((time.monotonic()-started)*1000)
+   app.logger.info('Full detection: features=%d matches=%d validated=%d detections=%d ms=%d',diag['features'],diag['matches'],diag['inliers'],len(out),diag['ms'])
+   return jsonify(detections=out,mode='ORB32 completo',defects_available=False,diagnostics=diag,version='4.5')
   candidates=[]; peak=0; features=0
   with lock:
    # Analyze at the reference resolution, then at a smaller scale if necessary.
@@ -74,7 +99,7 @@ def detect():
     out.append(dict(name=label,center=[float(c[0]/w),float(c[1]/h)],matches=score))
   elapsed=round((time.monotonic()-started)*1000)
   app.logger.info('Detection: features=%d matches=%d detections=%d ms=%d',features,peak,len(out),elapsed)
-  return jsonify(detections=out,mode='ORB',defects_available=False,diagnostics=dict(features=features,matches=peak,inliers=max([a[0] for a in candidates],default=0),ms=elapsed),version='4.3')
+  return jsonify(detections=out,mode='ORB',defects_available=False,diagnostics=dict(features=features,matches=peak,inliers=max([a[0] for a in candidates],default=0),ms=elapsed),version='4.5')
  except Exception:
   app.logger.exception('Detection failed');return jsonify(error='No se pudo analizar el fotograma'),400
 if __name__=='__main__':app.run(host='0.0.0.0',port=int(os.environ.get('PORT',8000)))
