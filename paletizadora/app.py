@@ -1,4 +1,4 @@
-import os, json, base64, threading
+import os, json, base64, threading, time, logging, unicodedata
 from pathlib import Path
 import cv2
 import numpy as np
@@ -7,6 +7,8 @@ P=Path(__file__).parent
 app=Flask(__name__)
 app.config['MAX_CONTENT_LENGTH']=2500000
 cv2.setNumThreads(1)
+app.logger.setLevel(logging.INFO)
+def normalize(s):return ''.join(c for c in unicodedata.normalize('NFD',s.lower()) if unicodedata.category(c)!='Mn')
 refs={n:np.frombuffer(base64.b64decode(s),np.uint8).reshape(-1,10) for n,s in json.loads((P/'refs.json').read_text()).items()}
 annotations={
 '085935':[('Bloque de electroválvulas',[.39,.32,.65,.93])],
@@ -20,31 +22,44 @@ annotations={
 '090026':[('PLC Siemens S7-1200',[.22,.19,.59,.79]),('Módulo SM 1223',[.59,.25,.70,.79])],
 '090032':[('Fuente Omron 24 V',[.38,.26,.51,.90]),('Borneras X1',[.76,.17,.99,.57])],
 '090042':[('Paletizadora SMC',[.24,.14,.75,.85]),('Parada de emergencia',[.56,.64,.60,.72]),('Botonera',[.60,.65,.73,.74]),('Bandeja de paletización',[.33,.56,.45,.64]),('Baliza BR',[.27,.58,.32,.77])]}
-orb=cv2.ORB_create(nfeatures=2500,fastThreshold=10)
+orb=cv2.ORB_create(nfeatures=4000,fastThreshold=10)
 bf=cv2.BFMatcher(cv2.NORM_HAMMING)
 lock=threading.Lock()
 @app.get('/')
 def home():return send_from_directory(P,'index.html')
 @app.get('/api/health')
-def health():return jsonify(backend=True,references=len(refs),mode='ORB',yolo=False)
+def health():return jsonify(backend=True,references=len(refs),mode='ORB',yolo=False,version='4.3')
 @app.post('/api/detect')
 def detect():
  try:
-  data=request.get_json(); raw=base64.b64decode(data['image'].split(',')[-1],validate=True)
+  started=time.monotonic();data=request.get_json(); raw=base64.b64decode(data['image'].split(',')[-1],validate=True)
   im=cv2.imdecode(np.frombuffer(raw,np.uint8),cv2.IMREAD_GRAYSCALE)
   if im is None:return jsonify(error='Imagen inválida'),400
   h,w=im.shape;s=960/max(w,h);im=cv2.resize(im,(round(w*s),round(h*s)));h,w=im.shape
+  candidates=[]; peak=0; features=0
   with lock:
-   k,d=orb.detectAndCompute(im,None)
-   candidates=[]
-   if d is not None and len(d)>1:
+   # Analyze at the reference resolution, then at a smaller scale if necessary.
+   for factor in (1.,.75):
+    image=im if factor==1 else cv2.resize(im,None,fx=factor,fy=factor)
+    k,d=orb.detectAndCompute(image,None)
+    features=max(features,len(k))
+    if d is None or len(d)<2:continue
     for n,a in refs.items():
-     good=[m for pair in bf.knnMatch(a[:,2:].copy(),d[:,:8].copy(),k=2) if len(pair)==2 for m,b in [pair] if m.distance<.76*b.distance and m.distance<=19]
+     matches=[m for pair in bf.knnMatch(a[:,2:].copy(),d[:,:8].copy(),k=2) if len(pair)==2 for m,b in [pair] if m.distance<.87*b.distance and m.distance<=22]
+     # One reference point per observed keypoint.
+     unique={}
+     for m in sorted(matches,key=lambda m:m.distance):unique.setdefault(m.trainIdx,m)
+     good=list(unique.values());peak=max(peak,len(good))
      if len(good)<8:continue
-     src=np.float32([a[m.queryIdx,:2]/255*960 for m in good]);dst=np.float32([k[m.trainIdx].pt for m in good])
+     src=np.float32([a[m.queryIdx,:2]/255*960 for m in good]);dst=np.float32([np.array(k[m.trainIdx].pt)/factor for m in good])
      H,mask=cv2.findHomography(src,dst,cv2.RANSAC,5)
-     if H is None or mask is None or mask.sum()<7 or mask.sum()/len(good)<.55:continue
-     candidates.append((int(mask.sum()),n,H))
+     if H is None or mask is None or not np.isfinite(H).all():continue
+     count=int(mask.sum())
+     if count<8 or count/len(good)<.55:continue
+     support=dst[mask.ravel().astype(bool)]
+     if cv2.contourArea(cv2.convexHull(support))<.002*w*h:continue
+     candidates.append((count,n,H))
+    if candidates and max(c[0] for c in candidates)>=12:break
   out=[]
   if candidates:
    score,n,H=max(candidates,key=lambda x:x[0])
@@ -54,10 +69,12 @@ def detect():
     if abs(cv2.contourArea(q))<.0005*w*h or abs(cv2.contourArea(q))>1.3*w*h:continue
     c=cv2.perspectiveTransform(np.float32([[[(x+X)*480,(y+Y)*480]]]),H)[0,0]
     if not (0<=c[0]<w and 0<=c[1]<h):continue
-    prompt=str(data.get('prompt','')).strip().lower()
-    if prompt and not any(t.strip() in label.lower() for t in prompt.split(',') if t.strip()):continue
+    prompt=normalize(str(data.get('prompt','')).strip())
+    if prompt and not any(t.strip() in normalize(label) for t in prompt.split(',') if t.strip()):continue
     out.append(dict(name=label,center=[float(c[0]/w),float(c[1]/h)],matches=score))
-  return jsonify(detections=out,mode='ORB',defects_available=False)
+  elapsed=round((time.monotonic()-started)*1000)
+  app.logger.info('Detection: features=%d matches=%d detections=%d ms=%d',features,peak,len(out),elapsed)
+  return jsonify(detections=out,mode='ORB',defects_available=False,diagnostics=dict(features=features,matches=peak,inliers=max([a[0] for a in candidates],default=0),ms=elapsed),version='4.3')
  except Exception:
   app.logger.exception('Detection failed');return jsonify(error='No se pudo analizar el fotograma'),400
 if __name__=='__main__':app.run(host='0.0.0.0',port=int(os.environ.get('PORT',8000)))
